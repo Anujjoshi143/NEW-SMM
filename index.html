@@ -206,7 +206,8 @@ function markSynced(){_cloud={users:cloneMap(state.users),orders:cloneMap(state.
 function buildDiffOps(){const ops=[];for(const[coll,key]of COLLS){const local=cloneMap(state[key]);const synced=_cloud[key]||{};for(const id in local){if(JSON.stringify(local[id])!==JSON.stringify(synced[id]||null))ops.push({t:'set',coll,id,data:local[id]})}for(const id in synced){if(!(id in local))ops.push({t:'del',coll,id})}}const curCfg={settings:state.settings,next:state.next,deleted:state.deleted};if(JSON.stringify(curCfg)!==JSON.stringify(_cloud.config||null))ops.push({t:'cfg',data:curCfg});return ops}
 /* ops ko Firestore batches me chalao (500 limit se bachne ke liye 450 per batch) */
 async function runBatch(ops){let i=0;while(i<ops.length){const part=ops.slice(i,i+450);i+=450;const batch=firebaseDb.batch();for(const op of part){if(op.t==='set')batch.set(firebaseDb.collection(op.coll).doc(String(op.id)),op.data);else if(op.t==='del')batch.delete(firebaseDb.collection(op.coll).doc(String(op.id)));else if(op.t==='cfg')batch.set(firebaseDb.collection('config').doc('main'),Object.assign({},op.data,{seeded:true,updatedAt:Date.now()}))}await batch.commit()}}
-async function syncNow(){if(!firebaseReady||!firebaseDb)return;try{const ops=buildDiffOps();if(!ops.length)return;await runBatch(ops);markSynced()}catch(e){console.error('Cloud sync failed:',e)}}
+let syncFails=0;
+async function syncNow(){if(!firebaseReady||!firebaseDb)return;try{const ops=buildDiffOps();if(!ops.length)return;await runBatch(ops);syncFails=0;markSynced()}catch(e){console.error('Cloud sync failed:',e);syncFails++;if(!cloudWriteTimer)cloudWriteTimer=setTimeout(()=>{cloudWriteTimer=null;syncNow()},Math.min(30000,2000*syncFails))}}
 function scheduleCloudWrite(){if(cloudWriteTimer)return;cloudWriteTimer=setTimeout(()=>{cloudWriteTimer=null;syncNow()},1000)}
 /* ============ LIVE DATA SYNC (multi-tab / multi-window real-time) ============
    Problem fix: har tab ka apna in-memory state hota tha; doosre tab ka naya data
@@ -308,11 +309,41 @@ function pullLatest(silent){
 }
 /* doosre tab ne save kiya -> turant merge + live refresh (logout/login ki zaroorat nahi) */
 window.addEventListener('storage',e=>{if(e&&e.key===STORE)pullLatest(false)});
-/* tab par wapas aao ya 10 sec beet jaye -> ek baar aur check (mobile/missed events safety net) */
-window.addEventListener('focus',()=>pullLatest(false));
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)pullLatest(false)});
+/* cloud se fresh data kheecho (snapshot listeners miss ho jayein ya phone background se wapas aaye tab ke liye) */
+async function reconcileCloud(){
+  if(!firebaseReady||!firebaseDb)return;
+  try{
+    const[u,o,f,cfg]=await Promise.all([firebaseDb.collection('users').get(),firebaseDb.collection('orders').get(),firebaseDb.collection('funds').get(),firebaseDb.collection('config').doc('main').get()]);
+    const synth=snap=>snap.docs.map(d=>({type:'added',doc:{id:d.id,data:()=>d.data()}}));
+    applyChanges('users',synth(u));applyChanges('orders',synth(o));applyChanges('funds',synth(f));
+    if(cfg.exists){
+      const d=cfg.data();let ch=false;
+      if(d.settings&&JSON.stringify(d.settings)!==JSON.stringify(state.settings)){state.settings=Object.assign(state.settings,d.settings);ch=true}
+      if(d.deleted&&JSON.stringify(d.deleted)!==JSON.stringify(state.deleted)){state.deleted=normalizeDeleted(d.deleted);ch=true}
+      _cloud.config={settings:d.settings,next:d.next,deleted:d.deleted};
+      if(ch){saveLocal();scheduleRefresh()}
+    }
+    scheduleCloudWrite();
+  }catch(e){console.error('reconcile failed:',e)}
+}
+/* tab par wapas aao ya 10 sec beet jaye -> localStorage + cloud dono check (mobile/background safety net) */
+window.addEventListener('focus',()=>{pullLatest(false);reconcileCloud()});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden){pullLatest(false);reconcileCloud()}});
 setInterval(()=>pullLatest(false),10000);
-function save(localOnly){pullLatest(true);state.updatedAt=Date.now();saveLocal();if(state.currentUser!=null)sessionStorage.setItem(SESSION_KEY,String(state.currentUser));else sessionStorage.removeItem(SESSION_KEY);if(!localOnly&&firebaseDb)scheduleCloudWrite();renderNav()}
+setInterval(()=>{if(!document.hidden)reconcileCloud()},25000);
+function stampChangedDocs(){
+  if(!firebaseDb)return;
+  const strip=o=>{const c=Object.assign({},o);delete c.updatedAt;return JSON.stringify(c)};
+  for(const[coll,key]of COLLS){
+    const synced=_cloud[key]||{};
+    for(const it of(state[key]||[])){
+      if(!it||typeof it!=='object')continue;
+      const s=synced[String(it.id)];
+      if(!s||strip(it)!==strip(s))it.updatedAt=Date.now();
+    }
+  }
+}
+function save(localOnly){pullLatest(true);stampChangedDocs();state.updatedAt=Date.now();saveLocal();if(state.currentUser!=null)sessionStorage.setItem(SESSION_KEY,String(state.currentUser));else sessionStorage.removeItem(SESSION_KEY);if(!localOnly&&firebaseDb)scheduleCloudWrite();renderNav()}
 /* saari collections ko in-memory 'state' me lo (UI code unchanged); naya project ho to defaults seed ho jaate hain */
 async function loadFirebase(){
   if(!firebaseDb)return;
@@ -330,7 +361,9 @@ async function loadFirebase(){
     renderNav();routePage();attachListeners();
   }catch(e){
     console.error('Firebase database unavailable:',e);
-    /* Firebase na mile to offline cache se panel chalta rahe */
+    /* Firebase na mile to offline cache se panel chalta rahe;
+       listeners phir bhi lagao — network theek hote hi live updates milne lagenge */
+    try{attachListeners()}catch(e2){}
   }
 }
 /* ============ REAL-TIME SYNC (live updates) ============
@@ -340,13 +373,27 @@ async function loadFirebase(){
    auto-refresh skip hota hai taki user ka typed data na mitre. */
 let listenersAttached=false,renderTimer=null,currentAdminTab=null;
 function applyChanges(key,changes){
-  let changed=false;const arr=state[key]||(state[key]=[]);
+  let changed=false,keepLocal=false;const arr=state[key]||(state[key]=[]);
   changes.forEach(c=>{const id=c.doc.id,data=c.doc.data();_cloud[key]=_cloud[key]||{};
     if(c.type==='removed'){const n=arr.filter(it=>String(it.id)!==id);if(n.length!==arr.length){state[key]=n;changed=true}addTombstone(key,id);delete _cloud[key][id]}
     else{const idx=arr.findIndex(it=>String(it.id)===id);
-      if(idx>=0){if(JSON.stringify(arr[idx])!==JSON.stringify(data)){arr[idx]=data;changed=true}_cloud[key][id]=data}
-      else{arr.push(data);_cloud[key][id]=data;changed=true}}});
+      if(idx>=0){
+        /* conflict guard: local doc cloud doc se NAYA hai (updatedAt) -> local rakho, wapas push hoga */
+        const lt=Number((arr[idx]&&arr[idx].updatedAt)||0),rt=Number((data&&data.updatedAt)||0);
+        const localJs=JSON.stringify(arr[idx]);
+        if(lt>rt){keepLocal=true}
+        else if(lt===rt&&localJs!==JSON.stringify(data)&&localJs!==JSON.stringify(_cloud[key][id]||null)){
+          /* dono bina stamp (legacy): local me pending change hai jo abhi sync nahi hua -> local rakho */
+          keepLocal=true;
+        }
+        else{if(localJs!==JSON.stringify(data)){arr[idx]=data;changed=true}_cloud[key][id]=data}
+      }
+      else{
+        /* tombstoned item ko cloud snapshot wapas zinda na kare */
+        if(((state.deleted&&state.deleted[key])||[]).map(String).indexOf(String(id))>=0){keepLocal=true}
+        else{arr.push(data);_cloud[key][id]=data;changed=true}}}});
   if(changed){saveLocal();scheduleRefresh()}
+  if(keepLocal)scheduleCloudWrite();
 }
 function safeToAutoRender(){const r=route();const ae=document.activeElement;
   if(ae&&(ae.tagName==='INPUT'||ae.tagName==='TEXTAREA'||ae.tagName==='SELECT'||ae.isContentEditable))return false;
@@ -599,5 +646,5 @@ window.addEventListener('pagehide',()=>{if(cloudWriteTimer){clearTimeout(cloudWr
 (function(){let pn=location.pathname.split('/').pop().toLowerCase();if(!(pn==='sitemap.xml'||pn==='robots.txt')){if(state.currentUser==null){const sk=Number(sessionStorage.getItem(SESSION_KEY))||Number(localStorage.getItem(SESSION_KEY));if(sk){state.currentUser=sk;sessionStorage.setItem(SESSION_KEY,String(sk));localStorage.removeItem(SESSION_KEY)}}renderNav();routePage();loadFirebase()}})();
 })();
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a26419521dc629f2',t:'MTc4NTkxNTA1MQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a351ce5af9655520',t:'MTc4ODQwNzU5Mg=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a26419521dc629f2',t:'MTc4NTkxNTA1MQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a351efdc4b53d7e5',t:'MTc4ODQwODk2NA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>

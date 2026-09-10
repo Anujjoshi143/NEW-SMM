@@ -877,7 +877,7 @@ function orderPage(){
   let opts=list.map(s=>`<option value="${s.id}" data-rate="${s.rate}" data-min="${s.min}" data-max="${s.max}" ${String(s.id)===String(pick)?'selected':''}>${s.id} - ${esc(s.name)} | ${money(s.rate)}/1000</option>`).join('');
   set(`<div class="head"><div><h1>New Order</h1><p>Select service, paste link and enter quantity.</p></div><a class="btn ghost" href="#services">Services</a></div>
   <div class="grid grid2">
-    <div class="card"><form class="stack" id="orderForm"><label>Service<select name="service" id="svc">${opts}</select></label><label>Link<input name="link" type="url" required placeholder="https://instagram.com/p/xxxx"></label><label>Quantity<input name="qty" id="qty" type="number" required placeholder="100"></label><div class="notice">Charge: <b id="charge">${money(0)}</b> <span class="muted" id="chgWarn"></span></div><button class="btn full">Place Order</button></form></div>
+    <div class="card"><form class="stack" id="orderForm"><label>Service<select name="service" id="svc">${opts}</select></label><label>Link<input name="link" type="url" required placeholder="https://instagram.com/p/xxxx"></label><label>Quantity<input name="qty" id="qty" type="number" step="1" min="1" required placeholder="100"></label><div class="notice">Charge: <b id="charge">${money(0)}</b> <span class="muted" id="chgWarn"></span></div><button class="btn full">Place Order</button></form></div>
     <div class="card"><h2>Wallet</h2><p class="price">${money(w.available)}</p><p class="muted">Available balance (order amount yahan se katega)</p>
       <div class="softBox"><b>Balance</b><p class="muted">${money(w.balance)} total • ${money(w.held)} on payout hold</p></div>
       <div class="softBox" style="margin-top:10px"><b>Limits</b><p class="muted" id="limitText">Select service to see limits.</p></div>
@@ -889,7 +889,10 @@ function orderPage(){
   function calc(){
     let o=svc.options[svc.selectedIndex];if(!o)return;
     qty.min=o.dataset.min;qty.max=o.dataset.max;
-    let charge=(+o.dataset.rate)*(+qty.value||0)/100;
+    /* MATH FIX: display charge bilkul actual deduction jaisa (rate per 1000).
+       Pehle yahan /100 tha jo 10x zyada dikhata tha — ab /1000 + floor. */
+    let qv=Math.max(0,Math.floor(+qty.value||0));
+    let charge=round4(num(o.dataset.rate)*qv/1000);
     ch.textContent=money(charge);
     limit.textContent=`Min ${o.dataset.min} • Max ${o.dataset.max}`;
     if(warn)warn.textContent=charge>w.available?'⚠ wallet me balance kam hai':'';
@@ -904,7 +907,7 @@ function orderPage(){
     if(!link)return toast('Link required','err');
     let charge=round4(num(sv.rate)*q/1000),wall=walletOf(user);
     if(wall.available<charge){toast('Insufficient available balance — '+money(round4(charge-wall.available))+' aur chahiye','err');go('wallet');return}
-    user.balance=round4(num(user.balance)-charge);user.spent=round4(num(user.spent)+charge);
+    user.balance=round4(Math.max(0,num(user.balance)-charge));user.spent=round4(num(user.spent)+charge);
     let order={id:newId(),userId:user.id,service:sv.name,cat:sv.cat,link:link,qty:q,charge:charge,status:'Pending',remains:q,refunded:0,date:now()};
     state.orders.push(order);
     pushTxn(user.id,'Debit',-charge,'Order #'+order.id+' • '+sv.name);
@@ -1030,7 +1033,9 @@ function requestWithdraw(e){
   let fee=feeOf(amount,wc.fee),net=round4(Math.max(0,amount-fee));
   let rec={id:nextWdId(),userId:u.id,user:u.uid,amount:amount,fee:fee,net:net,method:method,detail:detail,note:note,status:WD.PENDING,date:now(),adminNote:'',ref:''};
   (state.withdrawals||(state.withdrawals=[])).push(rec);
-  u.balance=round4(Math.max(0,w.balance-amount));u.held=round4(num(u.held)+amount);
+  /* MATH FIX: hold hamesha AVAILABLE me se katega (total me se nahi),
+     warna pehle se pending payout ho to hawa me paisa ban jata tha. */
+  u.balance=round4(Math.max(0,w.available-amount));u.held=round4(num(u.held)+amount);
   pushTxn(u.id,'Hold',-amount,'Payout request #'+rec.id+' held');
   save();toast('Payout request #'+rec.id+' bhej diya — '+money(amount)+' hold par');
   adminNotify('withdraw',{username:u.uid,email:u.email,mobile:u.mobile,amount:amount,fee:fee,net:net,method:method,detail:detail,note:note,ref:rec.id,balance:walletOf(u).balance});
@@ -1301,9 +1306,10 @@ window.wdAct=(id,act)=>{
   if(why===null)return;
   w.status=WD.REJECTED;w.adminNote=String(why||'').trim().slice(0,200);w.reviewedAt=now();w.reviewedBy=(me()||{}).uid||'admin';
   if(u){
-    u.held=round4(Math.max(0,num(u.held)-amt));
-    u.balance=round4(Math.max(0,num(u.balance)+amt)); /* hold release -> wapas spendable */
-    pushTxn(u.id,'Unhold',amt,'Payout #'+w.id+' rejected — '+money(amt)+' released')
+    const rel=round4(Math.min(amt,Math.max(0,num(u.held))));
+    u.held=round4(Math.max(0,num(u.held)-rel));
+    u.balance=round4(Math.max(0,num(u.balance)+rel)); /* hold release -> wapas spendable */
+    pushTxn(u.id,'Unhold',rel,'Payout #'+w.id+' rejected — '+money(rel)+' released')
   }
   save();toast('Rejected — '+money(amt)+' wallet me wapas available');
   adminNotify('withdrawRejected',{username:w.user||'-',id:w.id,amount:amt,note:w.adminNote,balance:u?walletOf(u).balance:0});
@@ -1317,7 +1323,7 @@ window.wdDelete=id=>{
   if(!confirm('Payout request #'+id+' delete karein?'+hold))return;
   if(w.status===WD.PENDING){
     let u=state.users.find(x=>String(x.id)===String(w.userId)),amt=round4(Math.max(0,num(w.amount)));
-    if(u){u.held=round4(Math.max(0,num(u.held)-amt));u.balance=round4(Math.max(0,num(u.balance)+amt));pushTxn(u.id,'Unhold',amt,'Payout #'+w.id+' deleted — amount released')}
+    if(u){const rel=round4(Math.min(amt,Math.max(0,num(u.held))));u.held=round4(Math.max(0,num(u.held)-rel));u.balance=round4(Math.max(0,num(u.balance)+rel));pushTxn(u.id,'Unhold',rel,'Payout #'+w.id+' deleted — amount released')}
   }
   dropRecords('withdrawals',[id]);
   save();toast('Payout request deleted');adminWithdrawals()
